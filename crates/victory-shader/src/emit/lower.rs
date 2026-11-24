@@ -6487,8 +6487,7 @@ impl<'a> Lower<'a> {
             .exports
             .get(&(b, i))
             .ok_or("an export I/O raising did not see")?;
-        // Two f16 channels per source dword: only the pixel color and
-        // depth targets unpack them; the rest stay refused.
+        // Only pixel color and depth targets support packed channels.
         if e.compressed && !matches!(e.target, Target::Color(_) | Target::Depth) {
             return Err("a compressed export");
         }
@@ -6615,7 +6614,7 @@ impl<'a> Lower<'a> {
                 Target::Primitive => return Err("a primitive export"),
             };
             if let Some((id, col)) = found {
-                // Two f16 channels per dword: an odd channel the high half.
+                // Odd channels use the high half of the packed dword.
                 let half = e.compressed.then_some(ch % 2 == 1);
                 stores.push((id, col, value, half));
             }
@@ -6666,7 +6665,7 @@ impl<'a> Lower<'a> {
                             self.s.m.bin(c, Bin::And, x, mask)
                         };
                     }
-                    _ => {
+                    (_, 9) => {
                         // An f16 half, declared a 32-bit float on the host.
                         if high {
                             x = self.s.m.bin(c, Bin::LShr, x, k16);
@@ -6676,6 +6675,7 @@ impl<'a> Lower<'a> {
                                 .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[x]);
                         x = self.as_int(f);
                     }
+                    _ => return Err("a compressed export"),
                 }
             }
             let el = &mut elements(self, primitive)[id];
@@ -7072,7 +7072,26 @@ mod tests {
         }
     }
 
-    fn with_pixel_target<T>(words: &[u32], comp: u8, check: impl FnOnce(&Parts<'_>) -> T) -> T {
+    fn pixel_target(comp: u8) -> crate::emit::container::SigElement {
+        crate::emit::container::SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        }
+    }
+
+    fn with_pixel_outputs<T>(
+        words: &[u32],
+        outputs: Vec<crate::emit::container::SigElement>,
+        check: impl FnOnce(&Parts<'_>) -> T,
+    ) -> T {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Ps,
@@ -7092,18 +7111,6 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
-        let target = crate::emit::container::SigElement {
-            name: "SV_Target".into(),
-            index: 0,
-            kind: 16,
-            comp,
-            interp: 0,
-            row: Some(0),
-            col: 0,
-            cols: 4,
-            usage: 0,
-            half: false,
-        };
         check(&Parts {
             native: &native,
             p: &p,
@@ -7111,7 +7118,7 @@ mod tests {
             io: &io,
             res: &res,
             inputs: vec![],
-            outputs: vec![target],
+            outputs,
             prims: vec![],
             mesh_stride: 0,
         })
@@ -7128,7 +7135,7 @@ mod tests {
             0x0000_0100, // exp mrt0, v0, v0, v1, v1 done compr
             S_ENDPGM,
         ];
-        with_pixel_target(&words, 9, |parts| lower(parts).unwrap());
+        with_pixel_outputs(&words, vec![pixel_target(9)], |parts| lower(parts).unwrap());
     }
 
     #[test]
@@ -7151,7 +7158,7 @@ mod tests {
                 0x0000_0100, // exp mrt0, v0, v0, v1, v1 compr
                 S_ENDPGM,
             ];
-            with_pixel_target(&words, comp, |parts| {
+            with_pixel_outputs(&words, vec![pixel_target(comp)], |parts| {
                 let bad = super::HashMap::new();
                 let mut emitter = super::Lower::new(parts, &bad);
                 for i in 0..parts.p.blocks[0].insts.len() {
@@ -7167,6 +7174,38 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn a_compressed_depth_export_with_stencil_stays_refused() {
+        // `exp mrtz` compr packs the depth and the stencil into one dword.
+        // The stencil half is an integer, so the export stays refused.
+        let words = [
+            0x7E00_0282, // v_mov_b32 v0, 2
+            0xF800_0C8F,
+            0x0000_0000, // exp mrtz, v0, v0 done compr
+            S_ENDPGM,
+        ];
+        let element = |name: &str, kind: u8, comp: u8| crate::emit::container::SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp: 0,
+            row: None,
+            col: 0,
+            cols: 1,
+            usage: 0,
+            half: false,
+        };
+        let outputs = vec![element("SV_Depth", 17, 9), element("SV_StencilRef", 20, 5)];
+        assert!(matches!(
+            with_pixel_outputs(&words, outputs, lower),
+            Err(crate::ShaderError::Unsupported {
+                what: "a compressed export",
+                ..
+            })
+        ));
     }
 
     #[test]
