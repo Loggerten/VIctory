@@ -6270,20 +6270,39 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        let packed_color = e.compressed && matches!(e.target, Target::Color(_));
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
-                // An f16 half, declared a 32-bit float on the host.
                 let c = self.cur;
-                if high {
-                    let k16 = self.s.m.i32(16);
-                    x = self.s.m.bin(c, Bin::LShr, x, k16);
+                let k16 = self.s.m.i32(16);
+                match (packed_color, elements(self, primitive)[id].comp) {
+                    // Packed integer exports retain their integer values.
+                    (true, 4) => {
+                        if !high {
+                            x = self.s.m.bin(c, Bin::Shl, x, k16);
+                        }
+                        x = self.s.m.bin(c, Bin::AShr, x, k16);
+                    }
+                    (true, 5) => {
+                        x = if high {
+                            self.s.m.bin(c, Bin::LShr, x, k16)
+                        } else {
+                            let mask = self.s.m.i32(0xFFFF);
+                            self.s.m.bin(c, Bin::And, x, mask)
+                        };
+                    }
+                    _ => {
+                        // An f16 half, declared a 32-bit float on the host.
+                        if high {
+                            x = self.s.m.bin(c, Bin::LShr, x, k16);
+                        }
+                        let f =
+                            self.s
+                                .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[x]);
+                        x = self.as_int(f);
+                    }
                 }
-                let f32t = self.s.t.f32;
-                let f = self
-                    .s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-                x = self.as_int(f);
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
@@ -6602,8 +6621,7 @@ mod tests {
         .map(|_| ())
     }
 
-    /// Lowers a pixel program with one target: whether it translates.
-    fn lowers_ps(words: &[u32]) -> Result<(), crate::ShaderError> {
+    fn with_pixel_target<T>(words: &[u32], comp: u8, check: impl FnOnce(&Parts<'_>) -> T) -> T {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Ps,
@@ -6627,7 +6645,7 @@ mod tests {
             name: "SV_Target".into(),
             index: 0,
             kind: 16,
-            comp: 9,
+            comp,
             interp: 0,
             row: Some(0),
             col: 0,
@@ -6635,7 +6653,7 @@ mod tests {
             usage: 0,
             half: false,
         };
-        lower(&Parts {
+        check(&Parts {
             native: &native,
             p: &p,
             st: &st,
@@ -6646,7 +6664,6 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
     }
 
     #[test]
@@ -6660,7 +6677,45 @@ mod tests {
             0x0000_0100, // exp mrt0, v0, v0, v1, v1 done compr
             S_ENDPGM,
         ];
-        lowers_ps(&words).unwrap();
+        with_pixel_target(&words, 9, |parts| lower(parts).unwrap());
+    }
+
+    #[test]
+    fn compressed_color_exports_extend_packed_integer_channels() {
+        for (comp, low, high, expected) in [
+            (
+                4,
+                0xfffe0001,
+                0x7fff8001,
+                [1, 0xfffffffe, 0xffff8001, 0x7fff],
+            ),
+            (5, 0x00020001, 0xfffe8001, [1, 2, 0x8001, 0xfffe]),
+        ] {
+            let words = [
+                0x7e00_02ff,
+                low, // v_mov_b32 v0, low
+                0x7e02_02ff,
+                high, // v_mov_b32 v1, high
+                0xf800_1c0f,
+                0x0000_0100, // exp mrt0, v0, v0, v1, v1 compr
+                S_ENDPGM,
+            ];
+            with_pixel_target(&words, comp, |parts| {
+                let bad = super::HashMap::new();
+                let mut emitter = super::Lower::new(parts, &bad);
+                for i in 0..parts.p.blocks[0].insts.len() {
+                    assert!(emitter.inst(0, i).is_ok());
+                }
+                assert_eq!(
+                    emitter.s.m.constant_integer_output_channels(),
+                    expected
+                        .into_iter()
+                        .enumerate()
+                        .map(|(col, value)| { (Some(col as u32), Some(value)) })
+                        .collect::<Vec<_>>()
+                );
+            });
+        }
     }
 
     #[test]
