@@ -9012,10 +9012,13 @@ impl<'a> Lower<'a> {
             .exports
             .get(&(b, i))
             .ok_or("an export I/O raising did not see")?;
-        // Two f16 channels per source dword: only the pixel color and
-        // depth targets unpack them, and only into an output element the
-        // host declares a 32-bit float; the rest stay refused.
-        if e.compressed && !matches!(e.target, Target::Color(_) | Target::Depth) {
+        // Two f16 channels per source dword: only a pixel color target
+        // unpacks them, and only into an output element the host declares a
+        // 32-bit float; the rest stay refused. The `compr` bit says nothing
+        // about the target's format. A `mrtz` compr export is the stencil
+        // and sample-mask form (UINT16_ABGR in Mesa's `si_export_mrt_z`),
+        // not a depth.
+        if e.compressed && !matches!(e.target, Target::Color(_)) {
             return Err("a compressed export");
         }
         let guard = self.guard(b, i)?;
