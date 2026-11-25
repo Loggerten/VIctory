@@ -9012,8 +9012,9 @@ impl<'a> Lower<'a> {
             .exports
             .get(&(b, i))
             .ok_or("an export I/O raising did not see")?;
-        // Only pixel color and depth targets support packed channels.
-        if e.compressed && !matches!(e.target, Target::Color(_) | Target::Depth) {
+        // Packed color channels follow the output signature. A compressed
+        // MRTZ carries stencil/sample-mask data and cannot be unpacked as depth.
+        if e.compressed && !matches!(e.target, Target::Color(_)) {
             return Err("a compressed export");
         }
         let guard = self.guard(b, i)?;
@@ -9172,21 +9173,20 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
-        let packed_color = e.compressed && matches!(e.target, Target::Color(_));
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
                 let c = self.cur;
                 let k16 = self.s.m.i32(16);
-                match (packed_color, elements(self, primitive)[id].comp) {
+                match elements(self, primitive)[id].comp {
                     // Packed integer exports retain their integer values.
-                    (true, 4) => {
+                    4 => {
                         if !high {
                             x = self.s.m.bin(c, Bin::Shl, x, k16);
                         }
                         x = self.s.m.bin(c, Bin::AShr, x, k16);
                     }
-                    (true, 5) => {
+                    5 => {
                         x = if high {
                             self.s.m.bin(c, Bin::LShr, x, k16)
                         } else {
@@ -9194,7 +9194,7 @@ impl<'a> Lower<'a> {
                             self.s.m.bin(c, Bin::And, x, mask)
                         };
                     }
-                    (_, 9) => {
+                    9 => {
                         // An f16 half, declared a 32-bit float on the host.
                         if high {
                             x = self.s.m.bin(c, Bin::LShr, x, k16);
@@ -10098,9 +10098,8 @@ mod tests {
     }
 
     #[test]
-    fn a_compressed_depth_export_with_stencil_stays_refused() {
-        // `exp mrtz` compr packs the depth and the stencil into one dword.
-        // The stencil half is an integer, so the export stays refused.
+    fn a_compressed_mrtz_export_stays_refused() {
+        // A depth/stencil signature must not turn a compressed MRTZ into depth.
         let words = [
             0x7E00_0282, // v_mov_b32 v0, 2
             0xF800_0C8F,
@@ -10119,14 +10118,18 @@ mod tests {
             usage: 0,
             half: false,
         };
-        let outputs = vec![element("SV_Depth", 17, 9), element("SV_StencilRef", 20, 5)];
-        assert!(matches!(
-            with_pixel_outputs(&words, outputs, lower),
-            Err(crate::ShaderError::Unsupported {
-                what: "a compressed export",
-                ..
-            })
-        ));
+        for outputs in [
+            vec![element("SV_Depth", 17, 9)],
+            vec![element("SV_Depth", 17, 9), element("SV_StencilRef", 20, 5)],
+        ] {
+            assert!(matches!(
+                with_pixel_outputs(&words, outputs, lower),
+                Err(crate::ShaderError::Unsupported {
+                    what: "a compressed export",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
