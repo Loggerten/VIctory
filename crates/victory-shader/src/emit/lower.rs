@@ -9119,10 +9119,26 @@ impl<'a> Lower<'a> {
             .exports
             .get(&(b, i))
             .ok_or("an export I/O raising did not see")?;
-        // Packed color channels follow the output signature. A compressed
-        // MRTZ carries stencil/sample-mask data and cannot be unpacked as depth.
-        if e.compressed && !matches!(e.target, Target::Color(_)) {
-            return Err("a compressed export");
+        if e.compressed {
+            // MRTZ packs stencil/sample-mask data and cannot be unpacked as depth.
+            let Target::Color(target) = e.target else {
+                return Err("a compressed export");
+            };
+            let integer = self.s.outputs.iter().any(|output| {
+                output.kind == 16
+                    && output.row == Some(u32::from(target))
+                    && matches!(output.comp, 4 | 5)
+            });
+            // The encoding does not specify the format of the packed halves.
+            // For float targets, require an FP16 producer before reinterpreting
+            // the bits as f16. For integer targets, reject known FP16 pairs.
+            let wrong_producer = e.values.iter().flatten().any(|&value| {
+                let packed_float = self.f16_packed(value);
+                if integer { packed_float } else { !packed_float }
+            });
+            if wrong_producer {
+                return Err("a compressed export");
+            }
         }
         let guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
@@ -9733,6 +9749,42 @@ impl<'a> Lower<'a> {
             .find(|i| i.writes.iter().any(|w| w.1 == v))
     }
 
+    /// Whether `v` holds two f16 values this shader packed with
+    /// `v_cvt_pkrtz_f16_f32`, through plain `v_mov_b32` copies of its
+    /// result (a copy keeps the bits). A `compr` export's dwords carry no
+    /// format, so only this producer proves the halves are f16 and not
+    /// UNORM16/SNORM16 ones ([`Lower::export`]).
+    fn f16_packed(&self, v: Value) -> bool {
+        let mut v = v;
+        // Copies chain a few deep at most; a cycle (a phi the block map made
+        // a move) ends the walk.
+        for _ in 0..8 {
+            let Some(inst) = self.def_inst(v) else {
+                return false;
+            };
+            let Fields::Valu(f) = &inst.fields else {
+                return false;
+            };
+            if f.sdwa.is_some() || f.dpp.is_some() {
+                return false;
+            }
+            if inst.name() == "v_cvt_pkrtz_f16_f32" {
+                return true;
+            }
+            if inst.name() != "v_mov_b32" {
+                return false;
+            }
+            let Some(&Operand::Vector { reg, .. }) = f.src.first() else {
+                return false;
+            };
+            let Some(src) = inst.read(Reg::V(reg)) else {
+                return false;
+            };
+            v = src;
+        }
+        false
+    }
+
     /// The constant `v` holds, `env` giving phi values: moves of constants.
     fn konst(&self, env: &HashMap<Value, u32>, v: Value) -> Option<u32> {
         if let Some(&k) = env.get(&v) {
@@ -10155,18 +10207,55 @@ mod tests {
         })
     }
 
+    // The low two bytes of the second word name the two packed VGPRs.
+    fn exp_compr(pair0: u32, pair1: u32) -> [u32; 2] {
+        [0xF800_0C0F, pair0 | (pair1 << 8)]
+    }
+
+    fn f16_compressed_export() -> [u32; 7] {
+        let [export, sources] = exp_compr(2, 3);
+        [
+            0x7E00_02F2, // v_mov_b32 v0, 1.0
+            0x7E02_02F4, // v_mov_b32 v1, 2.0
+            0x5E04_0300, // v_cvt_pkrtz_f16_f32 v2, v0, v1
+            0x5E06_0101, // v_cvt_pkrtz_f16_f32 v3, v1, v0
+            export,
+            sources,
+            S_ENDPGM,
+        ]
+    }
+
     #[test]
     fn a_compressed_export_unpacks_two_f16_channels_per_dword() {
-        // A compr export: each source dword packs two f16 channels, the
-        // low half first, so four channels come from two VGPRs.
-        let words = [
-            0x7E00_0282, // v_mov_b32 v0, 2
-            0x7E02_0282, // v_mov_b32 v1, 2
-            0xF800_0C0F,
-            0x0000_0100, // exp mrt0, v0, v0, v1, v1 done compr
-            S_ENDPGM,
-        ];
-        with_pixel_outputs(&words, vec![pixel_target(9)], |parts| lower(parts).unwrap());
+        with_pixel_outputs(&f16_compressed_export(), vec![pixel_target(9)], |parts| {
+            lower(parts).unwrap();
+        });
+    }
+
+    #[test]
+    fn a_compressed_float_export_from_another_producer_stays_refused() {
+        let [export, sources] = exp_compr(0, 1);
+        let words = [0x7E00_0282, 0x7E02_0282, export, sources, S_ENDPGM];
+        assert!(matches!(
+            with_pixel_outputs(&words, vec![pixel_target(9)], lower),
+            Err(crate::ShaderError::Unsupported {
+                what: "a compressed export",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_compressed_f16_export_to_an_integer_target_stays_refused() {
+        for comp in [4, 5] {
+            assert!(matches!(
+                with_pixel_outputs(&f16_compressed_export(), vec![pixel_target(comp)], lower),
+                Err(crate::ShaderError::Unsupported {
+                    what: "a compressed export",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
