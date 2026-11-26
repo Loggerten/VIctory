@@ -227,28 +227,26 @@ fn buffer_cache_invalidations_lower_as_no_ops() {
     );
 }
 
-/// Lowers a pixel program with one float `SV_Target0`.
-fn lowers_ps(words: &[u32]) -> Result<Lowered, crate::ShaderError> {
-    let target = crate::emit::container::SigElement {
+fn pixel_target(comp: u8) -> crate::emit::container::SigElement {
+    crate::emit::container::SigElement {
         name: "SV_Target".into(),
         index: 0,
         kind: 16,
-        comp: 9,
+        comp,
         interp: 0,
         row: Some(0),
         col: 0,
         cols: 4,
         usage: 0,
         half: false,
-    };
-    lowers_ps_with(words, vec![target])
+    }
 }
 
-/// [`lowers_ps`] with the output elements `outputs`.
-fn lowers_ps_with(
+fn with_pixel_outputs<T>(
     words: &[u32],
     outputs: Vec<crate::emit::container::SigElement>,
-) -> Result<Lowered, crate::ShaderError> {
+    check: impl FnOnce(&Parts<'_>) -> T,
+) -> T {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Ps,
@@ -268,7 +266,7 @@ fn lowers_ps_with(
     let st = structure::structure(&p).unwrap();
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
-    lower(&Parts {
+    check(&Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -282,49 +280,37 @@ fn lowers_ps_with(
     })
 }
 
-/// The two words of `exp mrt<target>, <pair0>, <pair1> done compr`.
-/// A compressed export names two source dwords, one per f16 pair, in the
-/// second word at bits 0 and 8; the channel bits in the first word do not
-/// name them. Build the words here so the pairs stay correct.
-fn exp_compr(mrt: u32, pair0: u32, pair1: u32) -> [u32; 2] {
-    [0xF800_0C0F | (mrt << 4), pair0 | (pair1 << 8)]
+// The low two bytes of the second word name the two packed VGPRs.
+fn exp_compr(pair0: u32, pair1: u32) -> [u32; 2] {
+    [0xF800_0C0F, pair0 | (pair1 << 8)]
+}
+
+fn f16_compressed_export() -> [u32; 7] {
+    let [export, sources] = exp_compr(2, 3);
+    [
+        0x7E00_02F2, // v_mov_b32 v0, 1.0
+        0x7E02_02F4, // v_mov_b32 v1, 2.0
+        0x5E04_0300, // v_cvt_pkrtz_f16_f32 v2, v0, v1
+        0x5E06_0101, // v_cvt_pkrtz_f16_f32 v3, v1, v0
+        export,
+        sources,
+        S_ENDPGM,
+    ]
 }
 
 #[test]
 fn a_compressed_export_unpacks_two_f16_channels_per_dword() {
-    // A compr export: each source dword packs two f16 channels, the
-    // low half first, so four channels come from two VGPRs. Both dwords
-    // come from v_cvt_pkrtz_f16_f32, the producer that proves the halves
-    // are f16.
-    let mut words = vec![
-        0x7E00_0282,                         // v_mov_b32 v0, 2
-        0x7E02_0282,                         // v_mov_b32 v1, 2
-        0x2F << 25 | 2 << 17 | 2 << 9 | 256, // v_cvt_pkrtz_f16_f32 v2, 1.0, v2
-        0x2F << 25 | 3 << 17 | 3 << 9 | 256, // v_cvt_pkrtz_f16_f32 v3, 1.0, v3
-    ];
-    words.extend(exp_compr(0, 2, 3));
-    words.push(S_ENDPGM);
-    // Both dwords are pkrtz results, so the producer gate admits the
-    // export and the four halves widen through legacyF16ToF32. The
-    // stored values need a D3D run; the DXIL here is bitcode, whose
-    // function names are not contiguous bytes to search.
-    lowers_ps(&words).unwrap();
+    with_pixel_outputs(&f16_compressed_export(), vec![pixel_target(9)], |parts| {
+        lower(parts).unwrap();
+    });
 }
 
 #[test]
-fn a_compressed_export_from_another_producer_stays_refused() {
-    // A compr dword carries no format. Only v_cvt_pkrtz_f16_f32 proves
-    // the halves are f16; a dword built by moves could hold UNORM16 or
-    // SNORM16 halves, which legacyF16ToF32 would misread.
-    let words = [
-        0x7E00_0282, // v_mov_b32 v0, 2
-        0x7E02_0282, // v_mov_b32 v1, 2
-        0xF800_0C0F, // exp mrt0, v0, v0, v1, v1 done compr
-        0x0000_0100,
-        S_ENDPGM,
-    ];
+fn a_compressed_float_export_from_another_producer_stays_refused() {
+    let [export, sources] = exp_compr(0, 1);
+    let words = [0x7E00_0282, 0x7E02_0282, export, sources, S_ENDPGM];
     assert!(matches!(
-        lowers_ps(&words),
+        with_pixel_outputs(&words, vec![pixel_target(9)], lower),
         Err(crate::ShaderError::Unsupported {
             what: "a compressed export",
             ..
@@ -333,43 +319,59 @@ fn a_compressed_export_from_another_producer_stays_refused() {
 }
 
 #[test]
-fn a_compressed_export_to_a_uint_target_stays_refused() {
-    // The halves of a compr dword are f16 values: a uint target would
-    // store their f32 bits as integers, so the export stays refused. The
-    // sources are pkrtz-fed, so only the target type refuses it.
-    let mut words = vec![
-        0x7E00_0282,                         // v_mov_b32 v0, 2
-        0x7E02_0282,                         // v_mov_b32 v1, 2
-        0x2F << 25 | 2 << 17 | 2 << 9 | 256, // v_cvt_pkrtz_f16_f32 v2, 1.0, v2
-        0x2F << 25 | 3 << 17 | 3 << 9 | 256, // v_cvt_pkrtz_f16_f32 v3, 1.0, v3
-    ];
-    words.extend(exp_compr(0, 2, 3));
-    words.push(S_ENDPGM);
-    let target = crate::emit::container::SigElement {
-        name: "SV_Target".into(),
-        index: 0,
-        kind: 16,
-        comp: 5,
-        interp: 0,
-        row: Some(0),
-        col: 0,
-        cols: 4,
-        usage: 0,
-        half: false,
-    };
-    assert!(matches!(
-        lowers_ps_with(&words, vec![target]),
-        Err(crate::ShaderError::Unsupported {
-            what: "a compressed export",
-            ..
-        })
-    ));
+fn a_compressed_f16_export_to_an_integer_target_stays_refused() {
+    for comp in [4, 5] {
+        assert!(matches!(
+            with_pixel_outputs(&f16_compressed_export(), vec![pixel_target(comp)], lower),
+            Err(crate::ShaderError::Unsupported {
+                what: "a compressed export",
+                ..
+            })
+        ));
+    }
 }
 
 #[test]
-fn a_compressed_depth_export_with_stencil_stays_refused() {
-    // `exp mrtz` compr packs the depth and the stencil into one dword.
-    // The stencil half is an integer, so the export stays refused.
+fn compressed_color_exports_extend_packed_integer_channels() {
+    for (comp, low, high, expected) in [
+        (
+            4,
+            0xfffe0001,
+            0x7fff8001,
+            [1, 0xfffffffe, 0xffff8001, 0x7fff],
+        ),
+        (5, 0x00020001, 0xfffe8001, [1, 2, 0x8001, 0xfffe]),
+    ] {
+        let words = [
+            0x7e00_02ff,
+            low, // v_mov_b32 v0, low
+            0x7e02_02ff,
+            high, // v_mov_b32 v1, high
+            0xf800_1c0f,
+            0x0000_0100, // exp mrt0, v0, v0, v1, v1 compr
+            S_ENDPGM,
+        ];
+        with_pixel_outputs(&words, vec![pixel_target(comp)], |parts| {
+            let bad = super::HashMap::new();
+            let mut emitter = super::Lower::new(parts, &bad);
+            for i in 0..parts.p.blocks[0].insts.len() {
+                assert!(emitter.inst(0, i).is_ok());
+            }
+            assert_eq!(
+                emitter.s.m.constant_integer_output_channels(),
+                expected
+                    .into_iter()
+                    .enumerate()
+                    .map(|(col, value)| { (Some(col as u32), Some(value)) })
+                    .collect::<Vec<_>>()
+            );
+        });
+    }
+}
+
+#[test]
+fn a_compressed_mrtz_export_stays_refused() {
+    // A depth/stencil signature must not turn a compressed MRTZ into depth.
     let words = [
         0x7E00_0282, // v_mov_b32 v0, 2
         0xF800_0C8F,
@@ -388,14 +390,18 @@ fn a_compressed_depth_export_with_stencil_stays_refused() {
         usage: 0,
         half: false,
     };
-    let outputs = vec![element("SV_Depth", 17, 9), element("SV_StencilRef", 20, 5)];
-    assert!(matches!(
-        lowers_ps_with(&words, outputs),
-        Err(crate::ShaderError::Unsupported {
-            what: "a compressed export",
-            ..
-        })
-    ));
+    for outputs in [
+        vec![element("SV_Depth", 17, 9)],
+        vec![element("SV_Depth", 17, 9), element("SV_StencilRef", 20, 5)],
+    ] {
+        assert!(matches!(
+            with_pixel_outputs(&words, outputs, lower),
+            Err(crate::ShaderError::Unsupported {
+                what: "a compressed export",
+                ..
+            })
+        ));
+    }
 }
 
 #[test]

@@ -9997,28 +9997,26 @@ impl<'a> Lower<'a> {
             .exports
             .get(&(b, i))
             .ok_or("an export I/O raising did not see")?;
-        // Two f16 channels per source dword: only a pixel color target
-        // unpacks them, and only into an output element the host declares a
-        // 32-bit float; the rest stay refused. The `compr` bit says nothing
-        // about the target's format. A `mrtz` compr export is the stencil
-        // and sample-mask form (UINT16_ABGR in Mesa's `si_export_mrt_z`),
-        // not a depth.
-        if e.compressed && !matches!(e.target, Target::Color(_)) {
-            return Err("a compressed export");
-        }
-        // Nor does it say how the halves were made: a `compr` dword from
-        // `v_cvt_norm_u16_f16`/`v_cvt_norm_i16_f16` (or any other producer)
-        // holds UNORM16/SNORM16 halves, which `legacyF16ToF32` would read as
-        // f16. Each source dword must come from `v_cvt_pkrtz_f16_f32`, the
-        // one instruction that packs two f32 values as f16.
-        if e.compressed
-            && !e
-                .values
-                .iter()
-                .flatten()
-                .all(|&value| self.f16_packed(value))
-        {
-            return Err("a compressed export");
+        if e.compressed {
+            // MRTZ packs stencil/sample-mask data and cannot be unpacked as depth.
+            let Target::Color(target) = e.target else {
+                return Err("a compressed export");
+            };
+            let integer = self.s.outputs.iter().any(|output| {
+                output.kind == 16
+                    && output.row == Some(u32::from(target))
+                    && matches!(output.comp, 4 | 5)
+            });
+            // The encoding does not specify the format of the packed halves.
+            // For float targets, require an FP16 producer before reinterpreting
+            // the bits as f16. For integer targets, reject known FP16 pairs.
+            let wrong_producer = e.values.iter().flatten().any(|&value| {
+                let packed_float = self.f16_packed(value);
+                if integer { packed_float } else { !packed_float }
+            });
+            if wrong_producer {
+                return Err("a compressed export");
+            }
         }
         let guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
@@ -10147,15 +10145,8 @@ impl<'a> Lower<'a> {
                 Target::Primitive => return Err("a primitive export"),
             };
             if let Some((id, col)) = found {
-                // Two f16 channels per dword: an odd channel the high half.
+                // Odd channels use the high half of the packed dword.
                 let half = e.compressed.then_some(ch % 2 == 1);
-                // The halves are f16 values. An element the host does not
-                // declare a 32-bit float would store their f32 bits as an
-                // integer (a uint `SV_Target`, or the stencil of `mrtz`),
-                // so those stay refused.
-                if half.is_some() && outputs[id].comp != 9 {
-                    return Err("a compressed export");
-                }
                 stores.push((id, col, value, half));
             }
         }
@@ -10186,17 +10177,36 @@ impl<'a> Lower<'a> {
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
-                // An f16 half, declared a 32-bit float on the host.
                 let c = self.cur;
-                if high {
-                    let k16 = self.s.m.i32(16);
-                    x = self.s.m.bin(c, Bin::LShr, x, k16);
+                let k16 = self.s.m.i32(16);
+                match elements(self, primitive)[id].comp {
+                    // Packed integer exports retain their integer values.
+                    4 => {
+                        if !high {
+                            x = self.s.m.bin(c, Bin::Shl, x, k16);
+                        }
+                        x = self.s.m.bin(c, Bin::AShr, x, k16);
+                    }
+                    5 => {
+                        x = if high {
+                            self.s.m.bin(c, Bin::LShr, x, k16)
+                        } else {
+                            let mask = self.s.m.i32(0xFFFF);
+                            self.s.m.bin(c, Bin::And, x, mask)
+                        };
+                    }
+                    9 => {
+                        // An f16 half, declared a 32-bit float on the host.
+                        if high {
+                            x = self.s.m.bin(c, Bin::LShr, x, k16);
+                        }
+                        let f =
+                            self.s
+                                .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[x]);
+                        x = self.as_int(f);
+                    }
+                    _ => return Err("a compressed export"),
                 }
-                let f32t = self.s.t.f32;
-                let f = self
-                    .s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-                x = self.as_int(f);
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;

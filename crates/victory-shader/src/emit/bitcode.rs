@@ -214,6 +214,42 @@ pub(crate) struct Module {
 }
 
 impl Module {
+    #[cfg(test)]
+    pub(crate) fn constant_integer_output_channels(&self) -> Vec<(Option<u32>, Option<u32>)> {
+        fn constant(m: &Module, v: V) -> Option<u32> {
+            match v {
+                V::Const(id) => match m.consts[id as usize].1 {
+                    Const::Int(bits) => Some(bits as u32),
+                    _ => None,
+                },
+                V::Inst(id) => {
+                    let Op::Bin(op, lhs, rhs) = m.insts[id as usize].op else {
+                        return None;
+                    };
+                    let (lhs, rhs) = (constant(m, lhs)?, constant(m, rhs)?);
+                    match op {
+                        Bin::Shl => lhs.checked_shl(rhs),
+                        Bin::LShr => lhs.checked_shr(rhs),
+                        Bin::AShr => (lhs as i32).checked_shr(rhs).map(|bits| bits as u32),
+                        Bin::And => Some(lhs & rhs),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+
+        self.insts
+            .iter()
+            .filter_map(|inst| match &inst.op {
+                Op::Call(f, args) if self.funcs[*f as usize].name == "dx.op.storeOutput.i32" => {
+                    Some((constant(self, args[3]), constant(self, args[4])))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
             return Ty(t);
